@@ -5,7 +5,6 @@
 package io.flutter.plugins.videoplayer;
 
 import android.content.Context;
-import android.os.Build;
 import android.util.LongSparseArray;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -16,10 +15,7 @@ import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugins.videoplayer.platformview.PlatformVideoViewFactory;
 import io.flutter.plugins.videoplayer.platformview.PlatformViewVideoPlayer;
 import io.flutter.plugins.videoplayer.texture.TextureVideoPlayer;
-import io.flutter.plugins.videoplayer.surfacetexture.SurfaceTextureVideoPlayer;
 import io.flutter.view.TextureRegistry;
-
-import static io.flutter.Build.API_LEVELS;
 
 /** Android platform implementation of the VideoPlayerPlugin. */
 public class VideoPlayerPlugin implements FlutterPlugin, AndroidVideoPlayerApi {
@@ -70,9 +66,7 @@ public class VideoPlayerPlugin implements FlutterPlugin, AndroidVideoPlayerApi {
 
   public void onDestroy() {
     // The whole FlutterView is being destroyed. Here we release resources acquired for all
-    // instances of VideoPlayer. Once https://github.com/flutter/flutter/issues/19358 is resolved
-    // this may be replaced with just asserting that videoPlayers.isEmpty().
-    // https://github.com/flutter/flutter/issues/20989 tracks this.
+    // instances of VideoPlayer.
     disposeAllPlayers();
   }
 
@@ -102,43 +96,55 @@ public class VideoPlayerPlugin implements FlutterPlugin, AndroidVideoPlayerApi {
   public @NonNull TexturePlayerIds createForTextureView(@NonNull CreationOptions options) {
     final VideoAsset videoAsset = videoAssetWithOptions(options);
 
-    // Backward-compatibility for Android 10 and below:
-    // Devices on API 29 and lower do not support the new TextureRegistry.SurfaceProducer API,
-    // so we must use the legacy TextureRegistry.SurfaceTextureEntry API.
+    // Defensive initialization with small backoff; helps avoid flaky init crashes on some ROMs.
     final long id = nextPlayerIdentifier++;
     final String streamInstance = Long.toString(id);
 
-    if (Build.VERSION.SDK_INT <= API_LEVELS.API_29) {
-      // Legacy path for API <= 29 (Android 10 and below).
-      TextureRegistry.SurfaceTextureEntry handle =
-              flutterState.textureRegistry.createSurfaceTexture();
+    final int maxAttempts = 3;    // number of retries
+    final long baseSleepMs = 80L; // incremental backoff base delay
+    TextureRegistry.SurfaceProducer handle = null;
+    VideoPlayer videoPlayer = null;
+    RuntimeException lastError = null;
 
-      VideoPlayer videoPlayer =
-              SurfaceTextureVideoPlayer.create(
-                      flutterState.applicationContext,
-                      VideoPlayerEventCallbacks.bindTo(flutterState.binaryMessenger, streamInstance),
-                      handle,
-                      videoAsset,
-                      sharedOptions);
+    for (int attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        handle = flutterState.textureRegistry.createSurfaceProducer();
+        videoPlayer =
+                TextureVideoPlayer.create(
+                        flutterState.applicationContext,
+                        VideoPlayerEventCallbacks.bindTo(flutterState.binaryMessenger, streamInstance),
+                        handle,
+                        videoAsset,
+                        sharedOptions);
 
-      registerPlayerInstance(videoPlayer, id);
-      return new TexturePlayerIds(id, handle.id());
-    } else {
-      // Modern path for API >= 30.
-      TextureRegistry.SurfaceProducer handle =
-              flutterState.textureRegistry.createSurfaceProducer();
-
-      VideoPlayer videoPlayer =
-              TextureVideoPlayer.create(
-                      flutterState.applicationContext,
-                      VideoPlayerEventCallbacks.bindTo(flutterState.binaryMessenger, streamInstance),
-                      handle,
-                      videoAsset,
-                      sharedOptions);
-
-      registerPlayerInstance(videoPlayer, id);
-      return new TexturePlayerIds(id, handle.id());
+        // Success — register and return.
+        registerPlayerInstance(videoPlayer, id);
+        return new TexturePlayerIds(id, handle.id());
+      } catch (RuntimeException e) {
+        lastError = e;
+        Log.w(TAG, "Video init failed on attempt " + (attempt + 1) + "/" + maxAttempts + ": " + e);
+        // Clean up partially initialized handle before retrying.
+        if (handle != null) {
+          try {
+            handle.release();
+          } catch (Throwable ignored) {}
+          handle = null;
+        }
+        // Small incremental backoff.
+        try {
+          Thread.sleep(baseSleepMs * (attempt + 1));
+        } catch (InterruptedException ignored) {}
+      }
     }
+
+    // OPTIONAL fallback to platform view if your Dart side supports it (no textureId needed).
+    // long pvId = createForPlatformView(options);
+    // return new TexturePlayerIds(pvId, -1L);
+
+    // If we reach here — all attempts failed. Surface the most recent error.
+    throw (lastError != null)
+            ? lastError
+            : new RuntimeException("Video player initialization failed (unknown reason)");
   }
 
   private @NonNull VideoAsset videoAssetWithOptions(@NonNull CreationOptions options) {
