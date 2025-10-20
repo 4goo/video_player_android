@@ -5,6 +5,7 @@
 package io.flutter.plugins.videoplayer;
 
 import android.content.Context;
+import android.os.Build;
 import android.util.LongSparseArray;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -15,7 +16,10 @@ import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugins.videoplayer.platformview.PlatformVideoViewFactory;
 import io.flutter.plugins.videoplayer.platformview.PlatformViewVideoPlayer;
 import io.flutter.plugins.videoplayer.texture.TextureVideoPlayer;
+import io.flutter.plugins.videoplayer.surfacetexture.SurfaceTextureVideoPlayer;
 import io.flutter.view.TextureRegistry;
+
+import static io.flutter.Build.API_LEVELS;
 
 /** Android platform implementation of the VideoPlayerPlugin. */
 public class VideoPlayerPlugin implements FlutterPlugin, AndroidVideoPlayerApi {
@@ -32,19 +36,19 @@ public class VideoPlayerPlugin implements FlutterPlugin, AndroidVideoPlayerApi {
   public void onAttachedToEngine(@NonNull FlutterPluginBinding binding) {
     final FlutterInjector injector = FlutterInjector.instance();
     this.flutterState =
-        new FlutterState(
-            binding.getApplicationContext(),
-            binding.getBinaryMessenger(),
-            injector.flutterLoader()::getLookupKeyForAsset,
-            injector.flutterLoader()::getLookupKeyForAsset,
-            binding.getTextureRegistry());
+            new FlutterState(
+                    binding.getApplicationContext(),
+                    binding.getBinaryMessenger(),
+                    injector.flutterLoader()::getLookupKeyForAsset,
+                    injector.flutterLoader()::getLookupKeyForAsset,
+                    binding.getTextureRegistry());
     flutterState.startListening(this, binding.getBinaryMessenger());
 
     binding
-        .getPlatformViewRegistry()
-        .registerViewFactory(
-            "plugins.flutter.dev/video_player_android",
-            new PlatformVideoViewFactory(videoPlayers::get));
+            .getPlatformViewRegistry()
+            .registerViewFactory(
+                    "plugins.flutter.dev/video_player_android",
+                    new PlatformVideoViewFactory(videoPlayers::get));
   }
 
   @Override
@@ -66,9 +70,8 @@ public class VideoPlayerPlugin implements FlutterPlugin, AndroidVideoPlayerApi {
 
   public void onDestroy() {
     // The whole FlutterView is being destroyed. Here we release resources acquired for all
-    // instances
-    // of VideoPlayer. Once https://github.com/flutter/flutter/issues/19358 is resolved this may
-    // be replaced with just asserting that videoPlayers.isEmpty().
+    // instances of VideoPlayer. Once https://github.com/flutter/flutter/issues/19358 is resolved
+    // this may be replaced with just asserting that videoPlayers.isEmpty().
     // https://github.com/flutter/flutter/issues/20989 tracks this.
     disposeAllPlayers();
   }
@@ -85,11 +88,11 @@ public class VideoPlayerPlugin implements FlutterPlugin, AndroidVideoPlayerApi {
     long id = nextPlayerIdentifier++;
     final String streamInstance = Long.toString(id);
     VideoPlayer videoPlayer =
-        PlatformViewVideoPlayer.create(
-            flutterState.applicationContext,
-            VideoPlayerEventCallbacks.bindTo(flutterState.binaryMessenger, streamInstance),
-            videoAsset,
-            sharedOptions);
+            PlatformViewVideoPlayer.create(
+                    flutterState.applicationContext,
+                    VideoPlayerEventCallbacks.bindTo(flutterState.binaryMessenger, streamInstance),
+                    videoAsset,
+                    sharedOptions);
 
     registerPlayerInstance(videoPlayer, id);
     return id;
@@ -99,19 +102,43 @@ public class VideoPlayerPlugin implements FlutterPlugin, AndroidVideoPlayerApi {
   public @NonNull TexturePlayerIds createForTextureView(@NonNull CreationOptions options) {
     final VideoAsset videoAsset = videoAssetWithOptions(options);
 
-    long id = nextPlayerIdentifier++;
+    // Backward-compatibility for Android 10 and below:
+    // Devices on API 29 and lower do not support the new TextureRegistry.SurfaceProducer API,
+    // so we must use the legacy TextureRegistry.SurfaceTextureEntry API.
+    final long id = nextPlayerIdentifier++;
     final String streamInstance = Long.toString(id);
-    TextureRegistry.SurfaceProducer handle = flutterState.textureRegistry.createSurfaceProducer();
-    VideoPlayer videoPlayer =
-        TextureVideoPlayer.create(
-            flutterState.applicationContext,
-            VideoPlayerEventCallbacks.bindTo(flutterState.binaryMessenger, streamInstance),
-            handle,
-            videoAsset,
-            sharedOptions);
 
-    registerPlayerInstance(videoPlayer, id);
-    return new TexturePlayerIds(id, handle.id());
+    if (Build.VERSION.SDK_INT <= API_LEVELS.API_29) {
+      // Legacy path for API <= 29 (Android 10 and below).
+      TextureRegistry.SurfaceTextureEntry handle =
+              flutterState.textureRegistry.createSurfaceTexture();
+
+      VideoPlayer videoPlayer =
+              SurfaceTextureVideoPlayer.create(
+                      flutterState.applicationContext,
+                      VideoPlayerEventCallbacks.bindTo(flutterState.binaryMessenger, streamInstance),
+                      handle,
+                      videoAsset,
+                      sharedOptions);
+
+      registerPlayerInstance(videoPlayer, id);
+      return new TexturePlayerIds(id, handle.id());
+    } else {
+      // Modern path for API >= 30.
+      TextureRegistry.SurfaceProducer handle =
+              flutterState.textureRegistry.createSurfaceProducer();
+
+      VideoPlayer videoPlayer =
+              TextureVideoPlayer.create(
+                      flutterState.applicationContext,
+                      VideoPlayerEventCallbacks.bindTo(flutterState.binaryMessenger, streamInstance),
+                      handle,
+                      videoAsset,
+                      sharedOptions);
+
+      registerPlayerInstance(videoPlayer, id);
+      return new TexturePlayerIds(id, handle.id());
+    }
   }
 
   private @NonNull VideoAsset videoAssetWithOptions(@NonNull CreationOptions options) {
@@ -137,7 +164,7 @@ public class VideoPlayerPlugin implements FlutterPlugin, AndroidVideoPlayerApi {
         }
       }
       return VideoAsset.fromRemoteUrl(
-          uri, streamingFormat, options.getHttpHeaders(), options.getUserAgent());
+              uri, streamingFormat, options.getHttpHeaders(), options.getUserAgent());
     }
   }
 
@@ -148,7 +175,7 @@ public class VideoPlayerPlugin implements FlutterPlugin, AndroidVideoPlayerApi {
     final String channelSuffix = Long.toString(id);
     VideoPlayerInstanceApi.Companion.setUp(messenger, player, channelSuffix);
     player.setDisposeHandler(
-        () -> VideoPlayerInstanceApi.Companion.setUp(messenger, null, channelSuffix));
+            () -> VideoPlayerInstanceApi.Companion.setUp(messenger, null, channelSuffix));
 
     videoPlayers.put(id, player);
   }
@@ -184,8 +211,8 @@ public class VideoPlayerPlugin implements FlutterPlugin, AndroidVideoPlayerApi {
   @Override
   public @NonNull String getLookupKeyForAsset(@NonNull String asset, @Nullable String packageName) {
     return packageName == null
-        ? flutterState.keyForAsset.get(asset)
-        : flutterState.keyForAssetAndPackageName.get(asset, packageName);
+            ? flutterState.keyForAsset.get(asset)
+            : flutterState.keyForAssetAndPackageName.get(asset, packageName);
   }
 
   private interface KeyForAssetFn {
@@ -204,11 +231,11 @@ public class VideoPlayerPlugin implements FlutterPlugin, AndroidVideoPlayerApi {
     final TextureRegistry textureRegistry;
 
     FlutterState(
-        Context applicationContext,
-        BinaryMessenger messenger,
-        KeyForAssetFn keyForAsset,
-        KeyForAssetAndPackageName keyForAssetAndPackageName,
-        TextureRegistry textureRegistry) {
+            Context applicationContext,
+            BinaryMessenger messenger,
+            KeyForAssetFn keyForAsset,
+            KeyForAssetAndPackageName keyForAssetAndPackageName,
+            TextureRegistry textureRegistry) {
       this.applicationContext = applicationContext;
       this.binaryMessenger = messenger;
       this.keyForAsset = keyForAsset;
