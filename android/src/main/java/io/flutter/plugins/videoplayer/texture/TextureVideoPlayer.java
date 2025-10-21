@@ -6,18 +6,26 @@ package io.flutter.plugins.videoplayer.texture;
 
 import android.content.Context;
 import android.view.Surface;
+import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.RestrictTo;
 import androidx.annotation.VisibleForTesting;
 import androidx.media3.common.MediaItem;
+import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.mediacodec.MediaCodecInfo;
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
+import androidx.media3.exoplayer.mediacodec.MediaCodecUtil.DecoderQueryException;
 import io.flutter.plugins.videoplayer.ExoPlayerEventListener;
 import io.flutter.plugins.videoplayer.VideoAsset;
 import io.flutter.plugins.videoplayer.VideoPlayer;
 import io.flutter.plugins.videoplayer.VideoPlayerCallbacks;
 import io.flutter.plugins.videoplayer.VideoPlayerOptions;
 import io.flutter.view.TextureRegistry.SurfaceProducer;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
 
 /**
  * A subclass of {@link VideoPlayer} that adds functionality related to texture view as a way of
@@ -27,8 +35,11 @@ import io.flutter.view.TextureRegistry.SurfaceProducer;
  * the texture.
  */
 public final class TextureVideoPlayer extends VideoPlayer implements SurfaceProducer.Callback {
+  private static final String TAG = "TextureVideoPlayer";
+
   // True when the ExoPlayer instance has a null surface.
   private boolean needsSurface = true;
+
   /**
    * Creates a texture video player.
    *
@@ -41,31 +52,37 @@ public final class TextureVideoPlayer extends VideoPlayer implements SurfaceProd
    */
   @NonNull
   public static TextureVideoPlayer create(
-      @NonNull Context context,
-      @NonNull VideoPlayerCallbacks events,
-      @NonNull SurfaceProducer surfaceProducer,
-      @NonNull VideoAsset asset,
-      @NonNull VideoPlayerOptions options) {
+          @NonNull Context context,
+          @NonNull VideoPlayerCallbacks events,
+          @NonNull SurfaceProducer surfaceProducer,
+          @NonNull VideoAsset asset,
+          @NonNull VideoPlayerOptions options) {
+
+    // Renderers factory with decoder fallback and codec blacklist for buggy decoders (e.g., HiSilicon).
+    DefaultRenderersFactory renderersFactory =
+            new DefaultRenderersFactory(context)
+                    .setEnableDecoderFallback(true)
+                    .setMediaCodecSelector(new BlacklistingMediaCodecSelector());
+
     return new TextureVideoPlayer(
-        events,
-        surfaceProducer,
-        asset.getMediaItem(),
-        options,
-        () -> {
-          ExoPlayer.Builder builder =
-              new ExoPlayer.Builder(context)
-                  .setMediaSourceFactory(asset.getMediaSourceFactory(context));
-          return builder.build();
-        });
+            events,
+            surfaceProducer,
+            asset.getMediaItem(),
+            options,
+            () ->
+                    new ExoPlayer.Builder(context)
+                            .setRenderersFactory(renderersFactory)
+                            .setMediaSourceFactory(asset.getMediaSourceFactory(context))
+                            .build());
   }
 
   @VisibleForTesting
   public TextureVideoPlayer(
-      @NonNull VideoPlayerCallbacks events,
-      @NonNull SurfaceProducer surfaceProducer,
-      @NonNull MediaItem mediaItem,
-      @NonNull VideoPlayerOptions options,
-      @NonNull ExoPlayerProvider exoPlayerProvider) {
+          @NonNull VideoPlayerCallbacks events,
+          @NonNull SurfaceProducer surfaceProducer,
+          @NonNull MediaItem mediaItem,
+          @NonNull VideoPlayerOptions options,
+          @NonNull ExoPlayerProvider exoPlayerProvider) {
     super(events, mediaItem, options, surfaceProducer, exoPlayerProvider);
 
     surfaceProducer.setCallback(this);
@@ -78,14 +95,14 @@ public final class TextureVideoPlayer extends VideoPlayer implements SurfaceProd
   @NonNull
   @Override
   protected ExoPlayerEventListener createExoPlayerEventListener(
-      @NonNull ExoPlayer exoPlayer, @Nullable SurfaceProducer surfaceProducer) {
+          @NonNull ExoPlayer exoPlayer, @Nullable SurfaceProducer surfaceProducer) {
     if (surfaceProducer == null) {
       throw new IllegalArgumentException(
-          "surfaceProducer cannot be null to create an ExoPlayerEventListener for TextureVideoPlayer.");
+              "surfaceProducer cannot be null to create an ExoPlayerEventListener for TextureVideoPlayer.");
     }
     boolean surfaceProducerHandlesCropAndRotation = surfaceProducer.handlesCropAndRotation();
     return new TextureExoPlayerEventListener(
-        exoPlayer, videoPlayerEvents, surfaceProducerHandlesCropAndRotation);
+            exoPlayer, videoPlayerEvents, surfaceProducerHandlesCropAndRotation);
   }
 
   @RestrictTo(RestrictTo.Scope.LIBRARY)
@@ -111,5 +128,54 @@ public final class TextureVideoPlayer extends VideoPlayer implements SurfaceProd
     // TextureVideoPlayer must always set a surfaceProducer.
     assert surfaceProducer != null;
     surfaceProducer.release();
+  }
+
+  /**
+   * MediaCodecSelector that filters out known-problematic hardware decoders,
+   * and keeps Google's software decoder as a last resort.
+   */
+  private static final class BlacklistingMediaCodecSelector implements MediaCodecSelector {
+    @Override
+    public List<MediaCodecInfo> getDecoderInfos(
+            String mimeType, boolean requiresSecureDecoder, boolean requiresTunneling)
+            throws DecoderQueryException {
+
+      List<MediaCodecInfo> all =
+              MediaCodecSelector.DEFAULT.getDecoderInfos(
+                      mimeType, requiresSecureDecoder, requiresTunneling);
+      if (all == null || all.isEmpty()) {
+        return all;
+      }
+
+      List<MediaCodecInfo> filtered = new ArrayList<>();
+      for (MediaCodecInfo info : all) {
+        final String name = info.name.toLowerCase(Locale.US);
+
+        // Blacklist known-buggy decoders (HiSilicon/Kirin on some Huawei devices).
+        // Typical crash: IllegalStateException during dequeueOutputBuffer from OMX.hisi.video.decoder.avc.
+        if (name.contains("hisi") || name.contains("kirin")) {
+          Log.w(TAG, "Blacklisting codec: " + info.name);
+          continue;
+        }
+
+        filtered.add(info);
+      }
+
+      // If everything got filtered out, try to keep Google's software decoder as a last resort.
+      if (filtered.isEmpty()) {
+        for (MediaCodecInfo info : all) {
+          final String name = info.name.toLowerCase(Locale.US);
+          if (name.contains("omx.google")) {
+            filtered.add(info);
+          }
+        }
+        // If still empty, return original list (do not block playback entirely).
+        if (filtered.isEmpty()) {
+          return all;
+        }
+      }
+
+      return filtered;
+    }
   }
 }
